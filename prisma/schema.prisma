@@ -1,0 +1,30 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  passwordHash  String?   
+  googleId      String?   @unique
+  name          String?
+  createdAt     DateTime  @default(now())
+  
+  planType      PlanType  @default(TRIAL)
+  messagesUsed  Int       @default(0)
+  trialEndsAt   DateTime  
+  subscriptionStatus String @default("active") 
+
+  @@map("users")
+}
+
+enum PlanType {
+  TRIAL
+  ESSENTIAL
+  PROFESSIONAL
+}
