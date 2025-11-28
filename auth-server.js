@@ -1,13 +1,16 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const { PrismaClient } = require('@prisma/client');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const { OAuth2Client } = require('google-auth-library');
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import { PrismaClient } from '@prisma/client';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { OAuth2Client } from 'google-auth-library';
 
 const app = express();
-const prisma = new PrismaClient();
+
+// Otimização de conexão Serverless (Singleton Pattern)
+const prisma = global.prisma || new PrismaClient();
+if (process.env.NODE_ENV !== 'production') global.prisma = prisma;
 
 const port = process.env.PORT || 4000;
 const SECRET_KEY = process.env.JWT_SECRET;
@@ -33,7 +36,19 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   try {
     const decoded = jwt.verify(token, SECRET_KEY);
     
-    const user = await prisma.user.findUnique({ where: { id: decoded.userId } });
+    // OTIMIZAÇÃO: Trazemos APENAS os dados necessários para validar (Select)
+    // Isso reduz o tráfego de rede entre a API e o Banco Neon
+    const user = await prisma.user.findUnique({ 
+        where: { id: decoded.userId },
+        select: {
+            id: true,
+            planType: true,
+            trialEndsAt: true,
+            subscriptionStatus: true,
+            messagesUsed: true
+        }
+    });
+
     if (!user) return res.status(404).json({ allowed: false, error: 'Usuário não encontrado' });
 
     const now = new Date();
@@ -71,7 +86,6 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
     });
 
   } catch (error) {
-    console.error("Erro na validação:", error);
     return res.status(403).json({ allowed: false, error: 'Token inválido ou expirado' });
   }
 });
@@ -84,7 +98,12 @@ app.post('/tato/v2/auth/register', async (req, res) => {
   }
 
   try {
-    const existingUser = await prisma.user.findUnique({ where: { email } });
+    // Select aqui também para acelerar a checagem
+    const existingUser = await prisma.user.findUnique({ 
+        where: { email },
+        select: { id: true }
+    });
+    
     if (existingUser) return res.status(400).json({ error: 'Email já cadastrado.' });
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -101,13 +120,13 @@ app.post('/tato/v2/auth/register', async (req, res) => {
         trialEndsAt: trialEnds,
         messagesUsed: 0,
         subscriptionStatus: 'active'
-      }
+      },
+      select: { id: true } // Não precisamos retornar o objeto inteiro, só o ID
     });
 
     res.status(201).json({ message: 'Conta criada com sucesso!', userId: user.id });
 
   } catch (error) {
-    console.error(error);
     res.status(500).json({ error: 'Erro interno ao criar conta.' });
   }
 });
@@ -134,7 +153,6 @@ app.post('/tato/v2/auth/login', async (req, res) => {
     res.json({ token, name: user.name, plan: user.planType });
 
   } catch (error) {
-    console.error(error);
     res.status(500).json({ error: 'Erro interno no login.' });
   }
 });
@@ -181,13 +199,12 @@ app.post('/tato/v2/auth/google', async (req, res) => {
     res.json({ token, name: user.name, plan: user.planType });
 
   } catch (error) {
-    console.error("Erro Google Auth:", error);
     res.status(401).json({ error: 'Token Google inválido.' });
   }
 });
 
 app.get('/tato/v2/', (req, res) => {
-    res.send('Auth API está rodando com segurança.');
+    res.send('Auth API (ESM Optimized) está rodando com segurança.');
 });
 
 if (process.env.NODE_ENV !== 'production') {
@@ -196,4 +213,4 @@ if (process.env.NODE_ENV !== 'production') {
     });
 }
 
-module.exports = app;
+export default app;
