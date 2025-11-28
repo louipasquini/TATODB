@@ -24,7 +24,7 @@ const PLAN_LIMITS = {
   PROFESSIONAL: 8000
 };
 
-app.post('/internal/validate-usage', async (req, res) => {
+app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
@@ -76,7 +76,7 @@ app.post('/internal/validate-usage', async (req, res) => {
   }
 });
 
-app.post('/auth/register', async (req, res) => {
+app.post('/tato/v2/auth/register', async (req, res) => {
   const { email, password, name } = req.body;
 
   if (!email || !password) {
@@ -112,7 +112,7 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post('/tato/v2/auth/login', async (req, res) => {
   const { email, password } = req.body;
 
   try {
@@ -139,7 +139,7 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-app.post('/auth/google', async (req, res) => {
+app.post('/tato/v2/auth/google', async (req, res) => {
   const { googleToken } = req.body;
   
   try {
@@ -186,7 +186,7 @@ app.post('/auth/google', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => {
+app.get('/tato/v2/', (req, res) => {
     res.send('Auth API está rodando com segurança.');
 });
 
