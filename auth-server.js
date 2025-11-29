@@ -8,7 +8,6 @@ import { OAuth2Client } from 'google-auth-library';
 
 const app = express();
 
-// Otimização de conexão Serverless (Singleton Pattern)
 const prisma = global.prisma || new PrismaClient();
 if (process.env.NODE_ENV !== 'production') global.prisma = prisma;
 
@@ -36,8 +35,6 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   try {
     const decoded = jwt.verify(token, SECRET_KEY);
     
-    // OTIMIZAÇÃO: Trazemos APENAS os dados necessários para validar (Select)
-    // Isso reduz o tráfego de rede entre a API e o Banco Neon
     const user = await prisma.user.findUnique({ 
         where: { id: decoded.userId },
         select: {
@@ -98,7 +95,6 @@ app.post('/tato/v2/auth/register', async (req, res) => {
   }
 
   try {
-    // Select aqui também para acelerar a checagem
     const existingUser = await prisma.user.findUnique({ 
         where: { email },
         select: { id: true }
@@ -121,7 +117,7 @@ app.post('/tato/v2/auth/register', async (req, res) => {
         messagesUsed: 0,
         subscriptionStatus: 'active'
       },
-      select: { id: true } // Não precisamos retornar o objeto inteiro, só o ID
+      select: { id: true }
     });
 
     res.status(201).json({ message: 'Conta criada com sucesso!', userId: user.id });
@@ -161,11 +157,19 @@ app.post('/tato/v2/auth/google', async (req, res) => {
   const { googleToken } = req.body;
   
   try {
-    const ticket = await googleClient.verifyIdToken({
-        idToken: googleToken,
-        audience: GOOGLE_CLIENT_ID,
-    });
-    const { email, sub: googleId, name } = ticket.getPayload();
+    // CORREÇÃO: Usamos getTokenInfo para validar tokens vindos do chrome.identity
+    const tokenInfo = await googleClient.getTokenInfo(googleToken);
+    
+    // Segurança: Verifica se o token foi gerado para a SUA extensão
+    if (tokenInfo.aud !== GOOGLE_CLIENT_ID) {
+        return res.status(401).json({ error: 'Token gerado para aplicação desconhecida.' });
+    }
+
+    const { email, sub: googleId, email_verified } = tokenInfo;
+
+    if (email_verified !== 'true' && email_verified !== true) {
+        return res.status(401).json({ error: 'Email Google não verificado.' });
+    }
 
     let user = await prisma.user.findUnique({ where: { email } });
 
@@ -173,11 +177,14 @@ app.post('/tato/v2/auth/google', async (req, res) => {
         const trialEnds = new Date();
         trialEnds.setDate(trialEnds.getDate() + 7);
         
+        // Define nome baseado no email se não vier no token
+        const fallbackName = email.split('@')[0];
+
         user = await prisma.user.create({
             data: { 
                 email, 
                 googleId, 
-                name, 
+                name: fallbackName, 
                 planType: 'TRIAL',
                 trialEndsAt: trialEnds,
                 subscriptionStatus: 'active'
@@ -199,6 +206,7 @@ app.post('/tato/v2/auth/google', async (req, res) => {
     res.json({ token, name: user.name, plan: user.planType });
 
   } catch (error) {
+    console.error("Erro Google Auth:", error); // Útil manter log de erro de auth
     res.status(401).json({ error: 'Token Google inválido.' });
   }
 });
