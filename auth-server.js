@@ -33,8 +33,7 @@ app.use(cors({
 
 app.use(express.json());
 
-// --- CONFIGURAÇÃO DOS PLANOS (Adaptado para o Dashboard) ---
-// Esses dados alimentam tanto a validação quanto a interface visual
+// --- CONFIGURAÇÃO DOS PLANOS ---
 const PLAN_CONFIG = {
   TRIAL: {
     name: 'Teste Gratuito',
@@ -50,14 +49,13 @@ const PLAN_CONFIG = {
   },
   PROFESSIONAL: {
     name: 'Profissional',
-    limit: 6000, 
+    limit: 8000,
     price: 'R$ 39,90/mês',
     priceRaw: 39.90
   }
 };
 
-// --- ROTA DE DASHBOARD (NOVA) ---
-// Retorna todos os dados para montar a tela da imagem (Assinatura, Uso, Conta)
+// --- ROTA DE DASHBOARD ---
 app.get('/tato/v2/user/dashboard', async (req, res) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -67,9 +65,6 @@ app.get('/tato/v2/user/dashboard', async (req, res) => {
     try {
       const decoded = jwt.verify(token, SECRET_KEY);
       
-      // Busca dados completos do usuário
-      // NOTA: Adicione 'nextBillingDate' ao seu schema.prisma se não existir, 
-      // ou usaremos trialEndsAt como fallback.
       const user = await prisma.user.findUnique({ 
           where: { id: decoded.userId },
           select: {
@@ -80,7 +75,6 @@ app.get('/tato/v2/user/dashboard', async (req, res) => {
               trialEndsAt: true,
               subscriptionStatus: true,
               messagesUsed: true,
-              // nextBillingDate: true // Descomente se tiver esse campo no banco
           }
       });
   
@@ -88,22 +82,16 @@ app.get('/tato/v2/user/dashboard', async (req, res) => {
   
       const planDetails = PLAN_CONFIG[user.planType] || PLAN_CONFIG.TRIAL;
       
-      // Lógica de Data de Cobrança
-      // Se for Trial, a "próxima cobrança" é o fim do trial.
-      // Se for Assinatura, seria a data de renovação (mockamos +30 dias se não tiver no banco)
       let nextBilling = user.trialEndsAt;
       if (user.planType !== 'TRIAL') {
-          // Exemplo: user.nextBillingDate || new Date(Date.now() + 30*24*60*60*1000)
           nextBilling = new Date(); 
           nextBilling.setDate(nextBilling.getDate() + 30); 
       }
   
-      // Cálculo de Porcentagem
       const limit = planDetails.limit;
       const usage = user.messagesUsed;
       const percentage = Math.min(Math.round((usage / limit) * 100), 100);
   
-      // Formata Status para exibição
       let displayStatus = 'Inativo';
       if (user.planType === 'TRIAL') {
           displayStatus = new Date() < new Date(user.trialEndsAt) ? 'Teste Ativo' : 'Expirado';
@@ -111,7 +99,6 @@ app.get('/tato/v2/user/dashboard', async (req, res) => {
           displayStatus = user.subscriptionStatus === 'active' ? 'Ativo' : 'Pendente';
       }
   
-      // Resposta estruturada para o Frontend
       res.json({
         subscription: {
           planName: planDetails.name,
@@ -131,12 +118,38 @@ app.get('/tato/v2/user/dashboard', async (req, res) => {
       });
   
     } catch (error) {
-      console.error(error);
       return res.status(403).json({ error: 'Sessão inválida' });
     }
 });
 
-// --- ROTA VALIDATE USAGE (Mantida para a extensão) ---
+// --- ROTA DELETAR CONTA (NOVA) ---
+app.delete('/tato/v2/user/delete', async (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+  
+    if (!token) return res.status(401).json({ error: 'Token não fornecido' });
+  
+    try {
+      const decoded = jwt.verify(token, SECRET_KEY);
+      
+      // Tenta deletar o usuário
+      await prisma.user.delete({ 
+          where: { id: decoded.userId } 
+      });
+  
+      res.json({ success: true, message: 'Conta deletada permanentemente.' });
+  
+    } catch (error) {
+      // Código de erro do Prisma para "Registro não encontrado"
+      if (error.code === 'P2025') {
+          return res.status(404).json({ error: 'Usuário não encontrado.' });
+      }
+      console.error("Erro ao deletar conta:", error);
+      return res.status(500).json({ error: 'Erro interno ao deletar conta.' });
+    }
+});
+
+// --- ROTA VALIDATE USAGE ---
 app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -174,7 +187,6 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
       }
     }
 
-    // Usa a nova configuração centralizada
     const limit = PLAN_CONFIG[user.planType]?.limit || 4000;
     
     if (user.messagesUsed >= limit) {
@@ -200,7 +212,7 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   }
 });
 
-// ... (Rota register permanece igual) ...
+// --- ROTA REGISTER ---
 app.post('/tato/v2/auth/register', async (req, res) => {
   const { email, password, name } = req.body;
 
@@ -241,7 +253,7 @@ app.post('/tato/v2/auth/register', async (req, res) => {
   }
 });
 
-// ... (Rota login permanece igual) ...
+// --- ROTA LOGIN ---
 app.post('/tato/v2/auth/login', async (req, res) => {
   const { email, password } = req.body;
 
@@ -268,7 +280,7 @@ app.post('/tato/v2/auth/login', async (req, res) => {
   }
 });
 
-// --- ROTA GOOGLE AUTH (Suporte Multi-Client) ---
+// --- ROTA GOOGLE AUTH ---
 app.post('/tato/v2/auth/google', async (req, res) => {
   const { googleToken } = req.body;
   
@@ -288,7 +300,7 @@ app.post('/tato/v2/auth/google', async (req, res) => {
         return res.status(401).json({ error: 'Token Google inválido.' });
     }
 
-    const { email, sub: googleId, email_verified, name, picture } = payload;
+    const { email, sub: googleId, email_verified, name } = payload;
 
     if (!email_verified) {
         return res.status(401).json({ error: 'Email Google não verificado.' });
