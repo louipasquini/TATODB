@@ -13,19 +13,27 @@ if (process.env.NODE_ENV !== 'production') global.prisma = prisma;
 
 const port = process.env.PORT || 4000;
 const SECRET_KEY = process.env.JWT_SECRET;
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+// CERTIFIQUE-SE QUE ESTE ID É O MESMO DO FRONTEND
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID; 
 
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
-app.use(cors());
+// Configuração CORS mais permissiva para evitar erros de desenvolvimento
+app.use(cors({
+    origin: '*', // Em produção, mude para o domínio do seu frontend
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
 
 const PLAN_LIMITS = {
   TRIAL: 4000,
   ESSENTIAL: 4000,
-  PROFESSIONAL: 8000
+  PROFESSIONAL: 6000
 };
 
+// ... (Rota validate-usage permanece igual) ...
 app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -87,6 +95,7 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   }
 });
 
+// ... (Rota register permanece igual) ...
 app.post('/tato/v2/auth/register', async (req, res) => {
   const { email, password, name } = req.body;
 
@@ -127,6 +136,7 @@ app.post('/tato/v2/auth/register', async (req, res) => {
   }
 });
 
+// ... (Rota login permanece igual) ...
 app.post('/tato/v2/auth/login', async (req, res) => {
   const { email, password } = req.body;
 
@@ -153,21 +163,32 @@ app.post('/tato/v2/auth/login', async (req, res) => {
   }
 });
 
+// --- ROTA CORRIGIDA PARA O FRONTEND REACT ---
 app.post('/tato/v2/auth/google', async (req, res) => {
   const { googleToken } = req.body;
   
+  if (!googleToken) {
+      return res.status(400).json({ error: 'Token do Google não fornecido.' });
+  }
+
   try {
-    // CORREÇÃO: Usamos getTokenInfo para validar tokens vindos do chrome.identity
-    const tokenInfo = await googleClient.getTokenInfo(googleToken);
+    // ALTERAÇÃO IMPORTANTE: 
+    // O frontend React envia um "ID Token" (JWT), não um "Access Token".
+    // Por isso usamos verifyIdToken em vez de getTokenInfo.
+    const ticket = await googleClient.verifyIdToken({
+        idToken: googleToken,
+        audience: GOOGLE_CLIENT_ID, 
+    });
+
+    const payload = ticket.getPayload();
     
-    // Segurança: Verifica se o token foi gerado para a SUA extensão
-    if (tokenInfo.aud !== GOOGLE_CLIENT_ID) {
-        return res.status(401).json({ error: 'Token gerado para aplicação desconhecida.' });
+    if (!payload) {
+        return res.status(401).json({ error: 'Token Google inválido.' });
     }
 
-    const { email, sub: googleId, email_verified } = tokenInfo;
+    const { email, sub: googleId, email_verified, name, picture } = payload;
 
-    if (email_verified !== 'true' && email_verified !== true) {
+    if (!email_verified) {
         return res.status(401).json({ error: 'Email Google não verificado.' });
     }
 
@@ -177,20 +198,22 @@ app.post('/tato/v2/auth/google', async (req, res) => {
         const trialEnds = new Date();
         trialEnds.setDate(trialEnds.getDate() + 7);
         
-        // Define nome baseado no email se não vier no token
-        const fallbackName = email.split('@')[0];
+        // Usa o nome vindo do Google ou o email como fallback
+        const userName = name || email.split('@')[0];
 
         user = await prisma.user.create({
             data: { 
                 email, 
                 googleId, 
-                name: fallbackName, 
+                name: userName, 
                 planType: 'TRIAL',
                 trialEndsAt: trialEnds,
                 subscriptionStatus: 'active'
+                // Se tiver campo de avatar no banco: avatarUrl: picture
             }
         });
     } else if (!user.googleId) {
+        // Vincula a conta existente ao Google
         user = await prisma.user.update({
             where: { email },
             data: { googleId }
@@ -206,8 +229,8 @@ app.post('/tato/v2/auth/google', async (req, res) => {
     res.json({ token, name: user.name, plan: user.planType });
 
   } catch (error) {
-    console.error("Erro Google Auth:", error); // Útil manter log de erro de auth
-    res.status(401).json({ error: 'Token Google inválido.' });
+    console.error("Erro Google Auth:", error.message);
+    res.status(401).json({ error: 'Falha na autenticação com Google.' });
   }
 });
 
