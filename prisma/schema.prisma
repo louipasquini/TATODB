@@ -9,23 +9,26 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Modelo de Usuário baseado na lógica do api.js
+// Modelo de Usuário
 model User {
   id                 String    @id @default(uuid())
   email              String    @unique
   name               String?
   
   // Autenticação
-  passwordHash       String?   // Opcional, pois login via Google não gera hash de senha
-  googleId           String?   @unique // ID único do Google para vincular contas
+  passwordHash       String?   
+  googleId           String?   @unique 
+  
+  // Rastreamento de Dispositivo (Novo)
+  fingerprint        String?   
   
   // Dados do Plano e Assinatura
-  planType           String    @default("TRIAL") // Valores esperados: 'TRIAL', 'ESSENTIAL', 'PROFESSIONAL'
-  subscriptionStatus String    @default("active") // 'active', 'canceled', 'past_due'
+  planType           String    @default("TRIAL") 
+  subscriptionStatus String    @default("active") 
   
   // Controle de Datas
   trialEndsAt        DateTime?
-  nextBillingDate    DateTime? // Usado no dashboard para mostrar próxima cobrança
+  nextBillingDate    DateTime? 
   
   // Limites de Uso
   messagesUsed       Int       @default(0)
@@ -34,5 +37,21 @@ model User {
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
 
-  @@map("users") // Cria a tabela com nome minúsculo "users" no banco
+  @@map("users")
+}
+
+// NOVA TABELA: Histórico de Trials (Nunca é apagada)
+model TrialLog {
+  id          String   @id @default(uuid())
+  
+  // Armazenamos o hash do email para privacidade (GDPR/LGPD), mas permite verificar duplicidade
+  emailHash   String   @unique 
+  
+  // Identificador da máquina. Se a pessoa tentar criar outra conta na mesma máquina, pegamos aqui.
+  fingerprint String?  
+  
+  createdAt   DateTime @default(now())
+  
+  @@index([fingerprint])
+  @@map("trial_logs")
 }

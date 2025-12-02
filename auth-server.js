@@ -5,6 +5,7 @@ import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { OAuth2Client } from 'google-auth-library';
+import crypto from 'crypto'; // Necessário para gerar hash do email
 
 const app = express();
 
@@ -54,6 +55,45 @@ const PLAN_CONFIG = {
     priceRaw: 39.90
   }
 };
+
+// --- FUNÇÃO AUXILIAR: VERIFICAÇÃO DE ABUSO DE TRIAL ---
+async function checkTrialAbuse(email, fingerprint) {
+    // 1. Gera um hash do email para comparar anonimamente
+    const emailHash = crypto.createHash('sha256').update(email.toLowerCase().trim()).digest('hex');
+
+    // 2. Verifica se o Email já usou trial antes (mesmo se deletou a conta)
+    const emailUsed = await prisma.trialLog.findUnique({
+        where: { emailHash }
+    });
+
+    if (emailUsed) return { abuse: true, reason: 'email_used' };
+
+    // 3. Verifica se o Dispositivo (Fingerprint) já usou trial antes
+    if (fingerprint) {
+        const deviceUsed = await prisma.trialLog.findFirst({
+            where: { fingerprint }
+        });
+        if (deviceUsed) return { abuse: true, reason: 'device_used' };
+    }
+
+    return { abuse: false, emailHash };
+}
+
+// --- FUNÇÃO AUXILIAR: REGISTRAR USO DE TRIAL ---
+async function registerTrialUsage(emailHash, fingerprint) {
+    try {
+        await prisma.trialLog.create({
+            data: {
+                emailHash,
+                fingerprint
+            }
+        });
+    } catch (e) {
+        // Ignora erro se já existir (race condition)
+        console.log("Log de trial já existente ou erro:", e.message);
+    }
+}
+
 
 // --- ROTA DE DASHBOARD ---
 app.get('/tato/v2/user/dashboard', async (req, res) => {
@@ -122,7 +162,7 @@ app.get('/tato/v2/user/dashboard', async (req, res) => {
     }
 });
 
-// --- ROTA DELETAR CONTA (NOVA) ---
+// --- ROTA DELETAR CONTA ---
 app.delete('/tato/v2/user/delete', async (req, res) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -132,15 +172,16 @@ app.delete('/tato/v2/user/delete', async (req, res) => {
     try {
       const decoded = jwt.verify(token, SECRET_KEY);
       
-      // Tenta deletar o usuário
+      // O registro na tabela 'TrialLog' NÃO é deletado aqui.
+      // Isso garante que se ele tentar criar conta de novo com mesmo email, saberemos.
+      
       await prisma.user.delete({ 
           where: { id: decoded.userId } 
       });
   
-      res.json({ success: true, message: 'Conta deletada permanentemente.' });
+      res.json({ success: true, message: 'Conta deletada. Histórico de uso mantido anonimamente.' });
   
     } catch (error) {
-      // Código de erro do Prisma para "Registro não encontrado"
       if (error.code === 'P2025') {
           return res.status(404).json({ error: 'Usuário não encontrado.' });
       }
@@ -212,15 +253,16 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   }
 });
 
-// --- ROTA REGISTER ---
+// --- ROTA REGISTER (ATUALIZADA COM PROTEÇÃO) ---
 app.post('/tato/v2/auth/register', async (req, res) => {
-  const { email, password, name } = req.body;
+  const { email, password, name, fingerprint } = req.body; // Aceita fingerprint do front
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email e senha são obrigatórios.' });
   }
 
   try {
+    // 1. Verifica existência na tabela de usuários ativos
     const existingUser = await prisma.user.findUnique({ 
         where: { email },
         select: { id: true }
@@ -228,27 +270,50 @@ app.post('/tato/v2/auth/register', async (req, res) => {
     
     if (existingUser) return res.status(400).json({ error: 'Email já cadastrado.' });
 
+    // 2. VERIFICAÇÃO DE ABUSO DE TRIAL
+    const { abuse, emailHash } = await checkTrialAbuse(email, fingerprint);
+    
+    if (abuse) {
+        return res.status(403).json({ 
+            error: 'Este dispositivo ou e-mail já utilizou o período de teste gratuito anteriormente.' 
+        });
+    }
+
     const hashedPassword = await bcrypt.hash(password, 10);
     
     const trialEnds = new Date();
     trialEnds.setDate(trialEnds.getDate() + 7);
 
-    const user = await prisma.user.create({
-      data: {
-        email,
-        passwordHash: hashedPassword,
-        name,
-        planType: 'TRIAL',
-        trialEndsAt: trialEnds,
-        messagesUsed: 0,
-        subscriptionStatus: 'active'
-      },
-      select: { id: true }
+    // 3. Cria Usuário e Registra Log de Trial
+    const result = await prisma.$transaction(async (prisma) => {
+        const user = await prisma.user.create({
+            data: {
+                email,
+                passwordHash: hashedPassword,
+                name,
+                planType: 'TRIAL',
+                trialEndsAt: trialEnds,
+                messagesUsed: 0,
+                subscriptionStatus: 'active',
+                fingerprint: fingerprint || null
+            },
+            select: { id: true }
+        });
+
+        await prisma.trialLog.create({
+            data: {
+                emailHash,
+                fingerprint: fingerprint || null
+            }
+        });
+
+        return user;
     });
 
-    res.status(201).json({ message: 'Conta criada com sucesso!', userId: user.id });
+    res.status(201).json({ message: 'Conta criada com sucesso!', userId: result.id });
 
   } catch (error) {
+    console.error(error);
     res.status(500).json({ error: 'Erro interno ao criar conta.' });
   }
 });
@@ -280,9 +345,9 @@ app.post('/tato/v2/auth/login', async (req, res) => {
   }
 });
 
-// --- ROTA GOOGLE AUTH ---
+// --- ROTA GOOGLE AUTH (ATUALIZADA COM PROTEÇÃO) ---
 app.post('/tato/v2/auth/google', async (req, res) => {
-  const { googleToken } = req.body;
+  const { googleToken, fingerprint } = req.body; // Aceita fingerprint do front
   
   if (!googleToken) {
       return res.status(400).json({ error: 'Token do Google não fornecido.' });
@@ -296,35 +361,56 @@ app.post('/tato/v2/auth/google', async (req, res) => {
 
     const payload = ticket.getPayload();
     
-    if (!payload) {
-        return res.status(401).json({ error: 'Token Google inválido.' });
-    }
+    if (!payload) return res.status(401).json({ error: 'Token Google inválido.' });
 
     const { email, sub: googleId, email_verified, name } = payload;
 
-    if (!email_verified) {
-        return res.status(401).json({ error: 'Email Google não verificado.' });
-    }
+    if (!email_verified) return res.status(401).json({ error: 'Email Google não verificado.' });
 
     let user = await prisma.user.findUnique({ where: { email } });
 
+    // SE O USUÁRIO NÃO EXISTE, VAMOS CRIAR (VERIFICAR ABUSO ANTES)
     if (!user) {
+        // 1. VERIFICAÇÃO DE ABUSO DE TRIAL
+        const { abuse, emailHash } = await checkTrialAbuse(email, fingerprint);
+
+        // Se houve abuso, não criamos a conta ou criamos bloqueada? 
+        // Idealmente bloqueamos o registro para forçar contato ou login com conta antiga.
+        if (abuse) {
+            return res.status(403).json({ 
+                error: 'Este dispositivo ou e-mail já utilizou o período de teste gratuito anteriormente.' 
+            });
+        }
+
         const trialEnds = new Date();
         trialEnds.setDate(trialEnds.getDate() + 7);
-        
         const userName = name || email.split('@')[0];
 
-        user = await prisma.user.create({
-            data: { 
-                email, 
-                googleId, 
-                name: userName, 
-                planType: 'TRIAL',
-                trialEndsAt: trialEnds,
-                subscriptionStatus: 'active'
-            }
+        // 2. Cria Usuário e Registra Log de Trial
+        user = await prisma.$transaction(async (prisma) => {
+            const newUser = await prisma.user.create({
+                data: { 
+                    email, 
+                    googleId, 
+                    name: userName, 
+                    planType: 'TRIAL',
+                    trialEndsAt: trialEnds,
+                    subscriptionStatus: 'active',
+                    fingerprint: fingerprint || null
+                }
+            });
+
+            await prisma.trialLog.create({
+                data: {
+                    emailHash,
+                    fingerprint: fingerprint || null
+                }
+            });
+            return newUser;
         });
+
     } else if (!user.googleId) {
+        // Vincula a conta existente ao Google
         user = await prisma.user.update({
             where: { email },
             data: { googleId }
@@ -341,7 +427,11 @@ app.post('/tato/v2/auth/google', async (req, res) => {
 
   } catch (error) {
     console.error("Erro Google Auth:", error.message);
-    res.status(401).json({ error: 'Falha na autenticação com Google. Origem não autorizada.' });
+    // Se o erro for do nosso bloqueio de abuso (403), repassa o status
+    if (error.message.includes('teste gratuito')) {
+        return res.status(403).json({ error: 'Este dispositivo já utilizou o teste gratuito.' });
+    }
+    res.status(401).json({ error: 'Falha na autenticação com Google.' });
   }
 });
 
