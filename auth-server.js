@@ -58,15 +58,31 @@ const PLAN_CONFIG = {
 async function checkTrialAbuse(email, fingerprint) {
     const emailHash = crypto.createHash('sha256').update(email.toLowerCase().trim()).digest('hex');
 
+    // Verifica por Email
     const emailUsed = await prisma.trialLog.findUnique({ where: { emailHash } });
-    if (emailUsed) return { abuse: true, reason: 'email_used', emailHash };
-
-    if (fingerprint) {
-        const deviceUsed = await prisma.trialLog.findFirst({ where: { fingerprint } });
-        if (deviceUsed) return { abuse: true, reason: 'device_used', emailHash };
+    if (emailUsed) {
+        return { 
+            abuse: true, 
+            reason: 'email_used', 
+            emailHash, 
+            usageHistory: emailUsed.usageHistory || 0 // Recupera uso anterior
+        };
     }
 
-    return { abuse: false, emailHash };
+    // Verifica por Fingerprint
+    if (fingerprint) {
+        const deviceUsed = await prisma.trialLog.findFirst({ where: { fingerprint } });
+        if (deviceUsed) {
+            return { 
+                abuse: true, 
+                reason: 'device_used', 
+                emailHash, 
+                usageHistory: deviceUsed.usageHistory || 0 // Recupera uso anterior
+            };
+        }
+    }
+
+    return { abuse: false, emailHash, usageHistory: 0 };
 }
 
 // --- ROTA REGISTER ---
@@ -85,13 +101,13 @@ app.post('/tato/v2/auth/register', async (req, res) => {
     
     if (existingUser) return res.status(400).json({ error: 'Email já cadastrado.' });
 
-    const { abuse, emailHash } = await checkTrialAbuse(email, fingerprint);
+    const { abuse, emailHash, usageHistory } = await checkTrialAbuse(email, fingerprint);
     
     // Define se o usuário terá trial ou não
     const trialEnds = new Date();
     if (abuse) {
-        trialEnds.setDate(trialEnds.getDate() - 1); // Expira trial
-        console.log(`[Registro] Abuso detectado para ${email}. Criando conta sem trial.`);
+        trialEnds.setDate(trialEnds.getDate() - 1); // Expira trial imediatamente
+        console.log(`[Registro] Abuso detectado para ${email}. Restaurando uso: ${usageHistory}`);
     } else {
         trialEnds.setDate(trialEnds.getDate() + 7); // Trial normal
     }
@@ -99,7 +115,7 @@ app.post('/tato/v2/auth/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     
     const result = await prisma.$transaction(async (prisma) => {
-        // 1. Cria o usuário
+        // 1. Cria o usuário com o histórico de uso recuperado (se houver abuso)
         const user = await prisma.user.create({
             data: {
                 email,
@@ -107,20 +123,21 @@ app.post('/tato/v2/auth/register', async (req, res) => {
                 name,
                 planType: 'TRIAL',
                 trialEndsAt: trialEnds,
-                messagesUsed: 0,
+                messagesUsed: abuse ? usageHistory : 0, // Restaura o uso se for abuso
                 subscriptionStatus: 'active',
                 fingerprint: fingerprint || null
             },
             select: { id: true }
         });
 
-        // 2. Garante o registro no Log de Trial (USANDO UPSERT PARA NÃO QUEBRAR A TRANSAÇÃO)
+        // 2. Garante o registro no Log de Trial
         await prisma.trialLog.upsert({
             where: { emailHash },
-            update: {}, // Se já existe, não faz nada (mantém o log original)
+            update: { fingerprint: fingerprint || null }, // Atualiza fingerprint se mudou
             create: {
                 emailHash,
-                fingerprint: fingerprint || null
+                fingerprint: fingerprint || null,
+                usageHistory: 0 // Inicia log com 0
             }
         });
 
@@ -161,12 +178,12 @@ app.post('/tato/v2/auth/google', async (req, res) => {
 
     if (!user) {
         // NOVO USUÁRIO GOOGLE
-        const { abuse, emailHash } = await checkTrialAbuse(email, fingerprint);
+        const { abuse, emailHash, usageHistory } = await checkTrialAbuse(email, fingerprint);
 
         const trialEnds = new Date();
         if (abuse) {
             trialEnds.setDate(trialEnds.getDate() - 1);
-            console.log(`[Google] Abuso detectado para ${email}. Criando conta sem trial.`);
+            console.log(`[Google] Abuso detectado para ${email}. Restaurando uso: ${usageHistory}`);
         } else {
             trialEnds.setDate(trialEnds.getDate() + 7);
         }
@@ -182,15 +199,15 @@ app.post('/tato/v2/auth/google', async (req, res) => {
                     planType: 'TRIAL',
                     trialEndsAt: trialEnds,
                     subscriptionStatus: 'active',
-                    fingerprint: fingerprint || null
+                    fingerprint: fingerprint || null,
+                    messagesUsed: abuse ? usageHistory : 0 // Restaura uso se abuso
                 }
             });
 
-            // USANDO UPSERT PARA NÃO QUEBRAR A TRANSAÇÃO
             await prisma.trialLog.upsert({
                 where: { emailHash },
-                update: {}, 
-                create: { emailHash, fingerprint: fingerprint || null }
+                update: { fingerprint: fingerprint || null }, 
+                create: { emailHash, fingerprint: fingerprint || null, usageHistory: 0 }
             });
             
             return newUser;
@@ -213,7 +230,6 @@ app.post('/tato/v2/auth/google', async (req, res) => {
         token, 
         name: user.name, 
         plan: user.planType,
-        // Retorna aviso se acabou de criar e já estava expirado (abuso)
         warning: (user.createdAt > new Date(Date.now() - 10000) && user.trialEndsAt < new Date()) 
                  ? 'Período de teste já utilizado anteriormente.' 
                  : null
@@ -225,7 +241,7 @@ app.post('/tato/v2/auth/google', async (req, res) => {
   }
 });
 
-// --- ROTA DELETAR CONTA ---
+// --- ROTA DELETAR CONTA (ATUALIZADA) ---
 app.delete('/tato/v2/user/delete', async (req, res) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -234,9 +250,31 @@ app.delete('/tato/v2/user/delete', async (req, res) => {
   
     try {
       const decoded = jwt.verify(token, SECRET_KEY);
-      await prisma.user.delete({ where: { id: decoded.userId } });
-      res.json({ success: true, message: 'Conta deletada.' });
+      
+      const user = await prisma.user.findUnique({ where: { id: decoded.userId } });
+      
+      if (user) {
+          // Salva o uso atual no log permanente antes de deletar
+          const emailHash = crypto.createHash('sha256').update(user.email.toLowerCase().trim()).digest('hex');
+          
+          await prisma.trialLog.upsert({
+              where: { emailHash },
+              update: { usageHistory: user.messagesUsed }, // Salva o quanto usou até agora
+              create: { 
+                  emailHash, 
+                  fingerprint: user.fingerprint, 
+                  usageHistory: user.messagesUsed 
+              }
+          });
+
+          await prisma.user.delete({ where: { id: decoded.userId } });
+          res.json({ success: true, message: 'Conta deletada.' });
+      } else {
+          res.status(404).json({ error: 'Usuário não encontrado.' });
+      }
+
     } catch (error) {
+      console.error("Erro delete:", error);
       res.status(500).json({ error: 'Erro interno ao deletar conta.' });
     }
 });
@@ -301,7 +339,7 @@ app.get('/tato/v2/user/dashboard', async (req, res) => {
     }
 });
 
-// --- ROTA VALIDATE USAGE ---
+// --- ROTA VALIDATE USAGE (BLOQUEIO) ---
 app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -318,6 +356,9 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
 
     const now = new Date();
 
+    // 1. BLOQUEIO DE TEMPO (TRIAL)
+    // Se for Trial e a data de hoje for maior que trialEndsAt, bloqueia.
+    // Como abusadores tem trialEndsAt setado para o passado, eles caem aqui.
     if (user.planType === 'TRIAL') {
       if (now > user.trialEndsAt) {
         return res.status(403).json({ 
@@ -326,11 +367,13 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
         });
       }
     } else {
+      // Bloqueio de Assinatura Inativa
       if (user.subscriptionStatus !== 'active') {
         return res.status(403).json({ allowed: false, error: 'Assinatura inativa ou cancelada.' });
       }
     }
 
+    // 2. BLOQUEIO DE LIMITE (MENSAGENS)
     const limit = PLAN_CONFIG[user.planType]?.limit || 4000;
     if (user.messagesUsed >= limit) {
       return res.status(429).json({ allowed: false, error: `Limite atingido.` });

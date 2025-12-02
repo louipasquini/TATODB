@@ -42,15 +42,11 @@ model User {
 
 // NOVA TABELA: Histórico de Trials (Nunca é apagada)
 model TrialLog {
-  id          String   @id @default(uuid())
-  
-  // Armazenamos o hash do email para privacidade (GDPR/LGPD), mas permite verificar duplicidade
-  emailHash   String   @unique 
-  
-  // Identificador da máquina. Se a pessoa tentar criar outra conta na mesma máquina, pegamos aqui.
-  fingerprint String?  
-  
-  createdAt   DateTime @default(now())
+  id           String   @id @default(uuid())
+  emailHash    String   @unique
+  fingerprint  String?
+  usageHistory Int      @default(0) // <--- CAMPO NOVO
+  createdAt    DateTime @default(now())
   
   @@index([fingerprint])
   @@map("trial_logs")
