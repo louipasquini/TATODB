@@ -15,20 +15,16 @@ const port = process.env.PORT || 4000;
 const SECRET_KEY = process.env.JWT_SECRET;
 
 // --- CONFIGURAÇÃO DE MÚLTIPLOS CLIENT IDS ---
-// Carrega os IDs de ambiente. É recomendável ter ambos no .env
 const GOOGLE_EXTENSION_CLIENT_ID = process.env.GOOGLE_CLIENT_ID; 
 const GOOGLE_WEB_CLIENT_ID = process.env.GOOGLE_WEB_CLIENT_ID;
 
-// Lista de origens confiáveis (Audiences)
 const ALLOWED_GOOGLE_CLIENT_IDS = [
     GOOGLE_EXTENSION_CLIENT_ID,
     GOOGLE_WEB_CLIENT_ID
-].filter(id => !!id); // Remove undefined/null se alguma variavel não estiver setada
+].filter(id => !!id);
 
-// Instancia o cliente (pode usar qualquer um dos IDs para instanciar, ou nenhum)
 const googleClient = new OAuth2Client(GOOGLE_EXTENSION_CLIENT_ID);
 
-// Configuração CORS
 app.use(cors({
     origin: '*', 
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
@@ -37,13 +33,110 @@ app.use(cors({
 
 app.use(express.json());
 
-const PLAN_LIMITS = {
-  TRIAL: 4000,
-  ESSENTIAL: 4000,
-  PROFESSIONAL: 8000
+// --- CONFIGURAÇÃO DOS PLANOS (Adaptado para o Dashboard) ---
+// Esses dados alimentam tanto a validação quanto a interface visual
+const PLAN_CONFIG = {
+  TRIAL: {
+    name: 'Teste Gratuito',
+    limit: 4000,
+    price: 'Grátis',
+    priceRaw: 0
+  },
+  ESSENTIAL: {
+    name: 'Essencial',
+    limit: 4000,
+    price: 'R$ 19,90/mês',
+    priceRaw: 19.90
+  },
+  PROFESSIONAL: {
+    name: 'Profissional',
+    limit: 6000, 
+    price: 'R$ 39,90/mês',
+    priceRaw: 39.90
+  }
 };
 
-// ... (Rota validate-usage permanece igual) ...
+// --- ROTA DE DASHBOARD (NOVA) ---
+// Retorna todos os dados para montar a tela da imagem (Assinatura, Uso, Conta)
+app.get('/tato/v2/user/dashboard', async (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+  
+    if (!token) return res.status(401).json({ error: 'Token não fornecido' });
+  
+    try {
+      const decoded = jwt.verify(token, SECRET_KEY);
+      
+      // Busca dados completos do usuário
+      // NOTA: Adicione 'nextBillingDate' ao seu schema.prisma se não existir, 
+      // ou usaremos trialEndsAt como fallback.
+      const user = await prisma.user.findUnique({ 
+          where: { id: decoded.userId },
+          select: {
+              id: true,
+              email: true,
+              name: true,
+              planType: true,
+              trialEndsAt: true,
+              subscriptionStatus: true,
+              messagesUsed: true,
+              // nextBillingDate: true // Descomente se tiver esse campo no banco
+          }
+      });
+  
+      if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+  
+      const planDetails = PLAN_CONFIG[user.planType] || PLAN_CONFIG.TRIAL;
+      
+      // Lógica de Data de Cobrança
+      // Se for Trial, a "próxima cobrança" é o fim do trial.
+      // Se for Assinatura, seria a data de renovação (mockamos +30 dias se não tiver no banco)
+      let nextBilling = user.trialEndsAt;
+      if (user.planType !== 'TRIAL') {
+          // Exemplo: user.nextBillingDate || new Date(Date.now() + 30*24*60*60*1000)
+          nextBilling = new Date(); 
+          nextBilling.setDate(nextBilling.getDate() + 30); 
+      }
+  
+      // Cálculo de Porcentagem
+      const limit = planDetails.limit;
+      const usage = user.messagesUsed;
+      const percentage = Math.min(Math.round((usage / limit) * 100), 100);
+  
+      // Formata Status para exibição
+      let displayStatus = 'Inativo';
+      if (user.planType === 'TRIAL') {
+          displayStatus = new Date() < new Date(user.trialEndsAt) ? 'Teste Ativo' : 'Expirado';
+      } else {
+          displayStatus = user.subscriptionStatus === 'active' ? 'Ativo' : 'Pendente';
+      }
+  
+      // Resposta estruturada para o Frontend
+      res.json({
+        subscription: {
+          planName: planDetails.name,
+          status: displayStatus,
+          value: planDetails.price,
+          nextBillingDate: nextBilling
+        },
+        usage: {
+          used: usage,
+          limit: limit,
+          percentage: percentage
+        },
+        account: {
+          email: user.email,
+          name: user.name
+        }
+      });
+  
+    } catch (error) {
+      console.error(error);
+      return res.status(403).json({ error: 'Sessão inválida' });
+    }
+});
+
+// --- ROTA VALIDATE USAGE (Mantida para a extensão) ---
 app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -81,7 +174,9 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
       }
     }
 
-    const limit = PLAN_LIMITS[user.planType];
+    // Usa a nova configuração centralizada
+    const limit = PLAN_CONFIG[user.planType]?.limit || 4000;
+    
     if (user.messagesUsed >= limit) {
       return res.status(429).json({ 
         allowed: false, 
@@ -182,8 +277,6 @@ app.post('/tato/v2/auth/google', async (req, res) => {
   }
 
   try {
-    // ALTERAÇÃO: Passamos o array de IDs permitidos no 'audience'.
-    // A biblioteca vai verificar se o token pertence a ALGUM desses IDs.
     const ticket = await googleClient.verifyIdToken({
         idToken: googleToken,
         audience: ALLOWED_GOOGLE_CLIENT_IDS, 
@@ -195,7 +288,6 @@ app.post('/tato/v2/auth/google', async (req, res) => {
         return res.status(401).json({ error: 'Token Google inválido.' });
     }
 
-    // Opcional: Você pode checar qual ID foi usado: payload.aud
     const { email, sub: googleId, email_verified, name, picture } = payload;
 
     if (!email_verified) {
@@ -221,7 +313,6 @@ app.post('/tato/v2/auth/google', async (req, res) => {
             }
         });
     } else if (!user.googleId) {
-        // Vincula a conta existente ao Google
         user = await prisma.user.update({
             where: { email },
             data: { googleId }
