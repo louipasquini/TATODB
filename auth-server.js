@@ -6,6 +6,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { OAuth2Client } from 'google-auth-library';
 import crypto from 'crypto';
+import Stripe from 'stripe'; // Integração Stripe
 
 const app = express();
 
@@ -14,6 +15,11 @@ if (process.env.NODE_ENV !== 'production') global.prisma = prisma;
 
 const port = process.env.PORT || 4000;
 const SECRET_KEY = process.env.JWT_SECRET;
+
+// Configuração Stripe
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY; 
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET; 
+const stripe = new Stripe(STRIPE_SECRET_KEY);
 
 const GOOGLE_EXTENSION_CLIENT_ID = process.env.GOOGLE_CLIENT_ID; 
 const GOOGLE_WEB_CLIENT_ID = process.env.GOOGLE_WEB_CLIENT_ID;
@@ -25,6 +31,91 @@ const ALLOWED_GOOGLE_CLIENT_IDS = [
 
 const googleClient = new OAuth2Client(GOOGLE_EXTENSION_CLIENT_ID);
 
+// --- 1. ROTA DE WEBHOOK STRIPE (IMPORTANTE: Antes dos middlewares globais) ---
+app.post('/tato/v2/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+        console.error(`Webhook Error: ${err.message}`);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+        switch (event.type) {
+            case 'checkout.session.completed': {
+                const session = event.data.object;
+                
+                const userId = session.metadata?.userId || session.client_reference_id;
+                const subscriptionId = session.subscription;
+                const customerId = session.customer;
+
+                if (!userId) {
+                    console.error("Webhook: User ID não encontrado.");
+                    break;
+                }
+
+                let planType = 'ESSENTIAL';
+                if (session.amount_total >= 3900) planType = 'PROFESSIONAL';
+
+                await prisma.user.update({
+                    where: { id: userId },
+                    data: {
+                        subscriptionStatus: 'active',
+                        planType: planType,
+                        stripeCustomerId: customerId,
+                        stripeSubscriptionId: subscriptionId,
+                        nextBillingDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+                    }
+                });
+                console.log(`[Stripe] Assinatura ativada para usuário ${userId}`);
+                break;
+            }
+
+            case 'invoice.payment_failed': {
+                const invoice = event.data.object;
+                const customerId = invoice.customer;
+                
+                const user = await prisma.user.findFirst({ where: { stripeCustomerId: customerId } });
+                if (user) {
+                    await prisma.user.update({
+                        where: { id: user.id },
+                        data: { subscriptionStatus: 'past_due' }
+                    });
+                    console.log(`[Stripe] Pagamento falhou para ${user.email}`);
+                }
+                break;
+            }
+
+            case 'customer.subscription.deleted': {
+                const subscription = event.data.object;
+                const customerId = subscription.customer;
+
+                const user = await prisma.user.findFirst({ where: { stripeCustomerId: customerId } });
+                if (user) {
+                    await prisma.user.update({
+                        where: { id: user.id },
+                        data: { 
+                            subscriptionStatus: 'canceled',
+                            planType: 'TRIAL', 
+                        }
+                    });
+                    console.log(`[Stripe] Assinatura cancelada para ${user.email}`);
+                }
+                break;
+            }
+        }
+    } catch (error) {
+        console.error("Erro processando webhook:", error);
+        return res.json({ received: true, status: 'error_processing' }); 
+    }
+
+    res.json({ received: true });
+});
+
+// --- 2. MIDDLEWARES GLOBAIS ---
 app.use(cors({
     origin: '*', 
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
@@ -54,22 +145,20 @@ const PLAN_CONFIG = {
   }
 };
 
-// --- FUNÇÕES AUXILIARES ---
+// --- FUNÇÕES AUXILIARES (PROTEÇÃO DE TRIAL) ---
 async function checkTrialAbuse(email, fingerprint) {
     const emailHash = crypto.createHash('sha256').update(email.toLowerCase().trim()).digest('hex');
 
-    // Verifica por Email
     const emailUsed = await prisma.trialLog.findUnique({ where: { emailHash } });
     if (emailUsed) {
         return { 
             abuse: true, 
             reason: 'email_used', 
             emailHash, 
-            usageHistory: emailUsed.usageHistory || 0 // Recupera uso anterior
+            usageHistory: emailUsed.usageHistory || 0 
         };
     }
 
-    // Verifica por Fingerprint
     if (fingerprint) {
         const deviceUsed = await prisma.trialLog.findFirst({ where: { fingerprint } });
         if (deviceUsed) {
@@ -77,7 +166,7 @@ async function checkTrialAbuse(email, fingerprint) {
                 abuse: true, 
                 reason: 'device_used', 
                 emailHash, 
-                usageHistory: deviceUsed.usageHistory || 0 // Recupera uso anterior
+                usageHistory: deviceUsed.usageHistory || 0 
             };
         }
     }
@@ -85,7 +174,86 @@ async function checkTrialAbuse(email, fingerprint) {
     return { abuse: false, emailHash, usageHistory: 0 };
 }
 
-// --- ROTA REGISTER ---
+// --- ROTAS DE PAGAMENTO (STRIPE) ---
+
+app.post('/tato/v2/payment/create-checkout', async (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) return res.status(401).json({ error: 'Token não fornecido' });
+
+    try {
+        const decoded = jwt.verify(token, SECRET_KEY);
+        const { priceId, planType } = req.body; 
+
+        const user = await prisma.user.findUnique({ where: { id: decoded.userId }});
+        let customerId = user.stripeCustomerId;
+
+        if (!customerId) {
+            const customer = await stripe.customers.create({
+                email: user.email,
+                name: user.name,
+                metadata: { userId: user.id }
+            });
+            customerId = customer.id;
+            await prisma.user.update({
+                where: { id: user.id },
+                data: { stripeCustomerId: customerId }
+            });
+        }
+
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'], 
+            customer: customerId,
+            line_items: [{ price: priceId, quantity: 1 }],
+            mode: 'subscription',
+            success_url: `${process.env.FRONTEND_URL}/dashboard?success=true`,
+            cancel_url: `${process.env.FRONTEND_URL}/checkout?canceled=true`,
+            metadata: {
+                userId: user.id,
+                planType: planType 
+            }
+        });
+
+        res.json({ url: session.url });
+
+    } catch (error) {
+        console.error("Erro checkout:", error);
+        res.status(500).json({ error: 'Erro ao criar checkout' });
+    }
+});
+
+app.post('/tato/v2/payment/customer-portal', async (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    try {
+        const decoded = jwt.verify(token, SECRET_KEY);
+        const user = await prisma.user.findUnique({ where: { id: decoded.userId }});
+
+        if (!user.stripeCustomerId) {
+            return res.status(400).json({ error: 'Usuário não possui assinatura ativa.' });
+        }
+
+        const session = await stripe.billingPortal.sessions.create({
+            customer: user.stripeCustomerId,
+            return_url: `${process.env.FRONTEND_URL}/dashboard`,
+        });
+
+        res.json({ url: session.url });
+    } catch (error) {
+        res.status(500).json({ error: 'Erro ao acessar portal' });
+    }
+});
+
+app.get('/tato/v2/payment/links', (req, res) => {
+    res.json({
+        essential: process.env.STRIPE_LINK_ESSENTIAL,
+        professional: process.env.STRIPE_LINK_PROFESSIONAL
+    });
+});
+
+// --- ROTA REGISTER (COM PROTEÇÃO DE TRIAL E UPSERT) ---
 app.post('/tato/v2/auth/register', async (req, res) => {
   const { email, password, name, fingerprint } = req.body;
 
@@ -103,19 +271,17 @@ app.post('/tato/v2/auth/register', async (req, res) => {
 
     const { abuse, emailHash, usageHistory } = await checkTrialAbuse(email, fingerprint);
     
-    // Define se o usuário terá trial ou não
     const trialEnds = new Date();
     if (abuse) {
-        trialEnds.setDate(trialEnds.getDate() - 1); // Expira trial imediatamente
+        trialEnds.setDate(trialEnds.getDate() - 1); 
         console.log(`[Registro] Abuso detectado para ${email}. Restaurando uso: ${usageHistory}`);
     } else {
-        trialEnds.setDate(trialEnds.getDate() + 7); // Trial normal
+        trialEnds.setDate(trialEnds.getDate() + 7); 
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
     
     const result = await prisma.$transaction(async (prisma) => {
-        // 1. Cria o usuário com o histórico de uso recuperado (se houver abuso)
         const user = await prisma.user.create({
             data: {
                 email,
@@ -123,21 +289,20 @@ app.post('/tato/v2/auth/register', async (req, res) => {
                 name,
                 planType: 'TRIAL',
                 trialEndsAt: trialEnds,
-                messagesUsed: abuse ? usageHistory : 0, // Restaura o uso se for abuso
+                messagesUsed: abuse ? usageHistory : 0, 
                 subscriptionStatus: 'active',
                 fingerprint: fingerprint || null
             },
             select: { id: true }
         });
 
-        // 2. Garante o registro no Log de Trial
         await prisma.trialLog.upsert({
             where: { emailHash },
-            update: { fingerprint: fingerprint || null }, // Atualiza fingerprint se mudou
+            update: { fingerprint: fingerprint || null },
             create: {
                 emailHash,
                 fingerprint: fingerprint || null,
-                usageHistory: 0 // Inicia log com 0
+                usageHistory: 0
             }
         });
 
@@ -156,7 +321,7 @@ app.post('/tato/v2/auth/register', async (req, res) => {
   }
 });
 
-// --- ROTA GOOGLE AUTH ---
+// --- ROTA GOOGLE AUTH (COM PROTEÇÃO E UPSERT) ---
 app.post('/tato/v2/auth/google', async (req, res) => {
   const { googleToken, fingerprint } = req.body;
   
@@ -177,7 +342,6 @@ app.post('/tato/v2/auth/google', async (req, res) => {
     let user = await prisma.user.findUnique({ where: { email } });
 
     if (!user) {
-        // NOVO USUÁRIO GOOGLE
         const { abuse, emailHash, usageHistory } = await checkTrialAbuse(email, fingerprint);
 
         const trialEnds = new Date();
@@ -200,7 +364,7 @@ app.post('/tato/v2/auth/google', async (req, res) => {
                     trialEndsAt: trialEnds,
                     subscriptionStatus: 'active',
                     fingerprint: fingerprint || null,
-                    messagesUsed: abuse ? usageHistory : 0 // Restaura uso se abuso
+                    messagesUsed: abuse ? usageHistory : 0
                 }
             });
 
@@ -241,7 +405,7 @@ app.post('/tato/v2/auth/google', async (req, res) => {
   }
 });
 
-// --- ROTA DELETAR CONTA (ATUALIZADA) ---
+// --- ROTA DELETAR CONTA (COM CANCELAMENTO NO STRIPE) ---
 app.delete('/tato/v2/user/delete', async (req, res) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -254,12 +418,23 @@ app.delete('/tato/v2/user/delete', async (req, res) => {
       const user = await prisma.user.findUnique({ where: { id: decoded.userId } });
       
       if (user) {
-          // Salva o uso atual no log permanente antes de deletar
+          // 1. Tenta cancelar a assinatura no Stripe se existir
+          if (user.stripeSubscriptionId) {
+              try {
+                  await stripe.subscriptions.cancel(user.stripeSubscriptionId);
+                  console.log(`[Delete] Assinatura ${user.stripeSubscriptionId} cancelada no Stripe.`);
+              } catch (stripeError) {
+                  // Loga o erro, mas não impede a deleção da conta local
+                  console.error("Erro ao cancelar assinatura no Stripe durante delete:", stripeError.message);
+              }
+          }
+
+          // 2. Salva uso atual no log permanente
           const emailHash = crypto.createHash('sha256').update(user.email.toLowerCase().trim()).digest('hex');
           
           await prisma.trialLog.upsert({
               where: { emailHash },
-              update: { usageHistory: user.messagesUsed }, // Salva o quanto usou até agora
+              update: { usageHistory: user.messagesUsed }, 
               create: { 
                   emailHash, 
                   fingerprint: user.fingerprint, 
@@ -268,7 +443,7 @@ app.delete('/tato/v2/user/delete', async (req, res) => {
           });
 
           await prisma.user.delete({ where: { id: decoded.userId } });
-          res.json({ success: true, message: 'Conta deletada.' });
+          res.json({ success: true, message: 'Conta deletada e assinatura cancelada.' });
       } else {
           res.status(404).json({ error: 'Usuário não encontrado.' });
       }
@@ -315,13 +490,13 @@ app.get('/tato/v2/user/dashboard', async (req, res) => {
       const planDetails = PLAN_CONFIG[user.planType] || PLAN_CONFIG.TRIAL;
       let nextBilling = user.trialEndsAt;
       if (user.planType !== 'TRIAL') {
-          nextBilling = new Date(); 
-          nextBilling.setDate(nextBilling.getDate() + 30); 
+          nextBilling = user.nextBillingDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
       }
   
       const limit = planDetails.limit;
       const usage = user.messagesUsed;
       const percentage = Math.min(Math.round((usage / limit) * 100), 100);
+      
       let displayStatus = 'Inativo';
       if (user.planType === 'TRIAL') {
           displayStatus = new Date() < new Date(user.trialEndsAt) ? 'Teste Ativo' : 'Expirado';
@@ -332,14 +507,14 @@ app.get('/tato/v2/user/dashboard', async (req, res) => {
       res.json({
         subscription: { planName: planDetails.name, status: displayStatus, value: planDetails.price, nextBillingDate: nextBilling },
         usage: { used: usage, limit: limit, percentage: percentage },
-        account: { email: user.email, name: user.name }
+        account: { id: user.id, email: user.email, name: user.name } 
       });
     } catch (error) {
       return res.status(403).json({ error: 'Sessão inválida' });
     }
 });
 
-// --- ROTA VALIDATE USAGE (BLOQUEIO) ---
+// --- ROTA VALIDATE USAGE (BLOQUEIO E CONTROLE) ---
 app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -356,9 +531,6 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
 
     const now = new Date();
 
-    // 1. BLOQUEIO DE TEMPO (TRIAL)
-    // Se for Trial e a data de hoje for maior que trialEndsAt, bloqueia.
-    // Como abusadores tem trialEndsAt setado para o passado, eles caem aqui.
     if (user.planType === 'TRIAL') {
       if (now > user.trialEndsAt) {
         return res.status(403).json({ 
@@ -367,13 +539,11 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
         });
       }
     } else {
-      // Bloqueio de Assinatura Inativa
       if (user.subscriptionStatus !== 'active') {
         return res.status(403).json({ allowed: false, error: 'Assinatura inativa ou cancelada.' });
       }
     }
 
-    // 2. BLOQUEIO DE LIMITE (MENSAGENS)
     const limit = PLAN_CONFIG[user.planType]?.limit || 4000;
     if (user.messagesUsed >= limit) {
       return res.status(429).json({ allowed: false, error: `Limite atingido.` });

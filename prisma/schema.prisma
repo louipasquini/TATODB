@@ -19,13 +19,17 @@ model User {
   passwordHash       String?   
   googleId           String?   @unique 
   
-  // Rastreamento de Dispositivo (Novo)
+  // Rastreamento de Dispositivo
   fingerprint        String?   
   
   // Dados do Plano e Assinatura
   planType           String    @default("TRIAL") 
   subscriptionStatus String    @default("active") 
   
+  // Integração Stripe (DEVEM ESTAR AQUI)
+  stripeCustomerId       String?   @unique // ID do cliente no Stripe
+  stripeSubscriptionId   String?   @unique // ID da assinatura vigente
+
   // Controle de Datas
   trialEndsAt        DateTime?
   nextBillingDate    DateTime? 
@@ -40,12 +44,12 @@ model User {
   @@map("users")
 }
 
-// NOVA TABELA: Histórico de Trials (Nunca é apagada)
+// Histórico de Trials (Nunca é apagada)
 model TrialLog {
   id           String   @id @default(uuid())
   emailHash    String   @unique
   fingerprint  String?
-  usageHistory Int      @default(0) // <--- CAMPO NOVO
+  usageHistory Int      @default(0) // Mantém o uso se a conta for recriada
   createdAt    DateTime @default(now())
   
   @@index([fingerprint])
