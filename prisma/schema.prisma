@@ -1,30 +1,38 @@
+// Configuração do Cliente Prisma
 generator client {
   provider = "prisma-client-js"
 }
 
+// Configuração do Banco de Dados (Neon usa Postgres)
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
+// Modelo de Usuário baseado na lógica do api.js
 model User {
-  id            String    @id @default(uuid())
-  email         String    @unique
-  passwordHash  String?   
-  googleId      String?   @unique
-  name          String?
-  createdAt     DateTime  @default(now())
+  id                 String    @id @default(uuid())
+  email              String    @unique
+  name               String?
   
-  planType      PlanType  @default(TRIAL)
-  messagesUsed  Int       @default(0)
-  trialEndsAt   DateTime  
-  subscriptionStatus String @default("active") 
+  // Autenticação
+  passwordHash       String?   // Opcional, pois login via Google não gera hash de senha
+  googleId           String?   @unique // ID único do Google para vincular contas
+  
+  // Dados do Plano e Assinatura
+  planType           String    @default("TRIAL") // Valores esperados: 'TRIAL', 'ESSENTIAL', 'PROFESSIONAL'
+  subscriptionStatus String    @default("active") // 'active', 'canceled', 'past_due'
+  
+  // Controle de Datas
+  trialEndsAt        DateTime?
+  nextBillingDate    DateTime? // Usado no dashboard para mostrar próxima cobrança
+  
+  // Limites de Uso
+  messagesUsed       Int       @default(0)
+  
+  // Metadados
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
 
-  @@map("users")
-}
-
-enum PlanType {
-  TRIAL
-  ESSENTIAL
-  PROFESSIONAL
+  @@map("users") // Cria a tabela com nome minúsculo "users" no banco
 }
