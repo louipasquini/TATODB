@@ -48,7 +48,7 @@ const PLAN_CONFIG = {
   },
   PROFESSIONAL: {
     name: 'Profissional',
-    limit: 6000,
+    limit: 8000,
     price: 'R$ 39,90/mês',
     priceRaw: 39.90
   }
@@ -69,7 +69,7 @@ async function checkTrialAbuse(email, fingerprint) {
     return { abuse: false, emailHash };
 }
 
-// --- ROTA REGISTER (CORRIGIDA) ---
+// --- ROTA REGISTER ---
 app.post('/tato/v2/auth/register', async (req, res) => {
   const { email, password, name, fingerprint } = req.body;
 
@@ -85,23 +85,21 @@ app.post('/tato/v2/auth/register', async (req, res) => {
     
     if (existingUser) return res.status(400).json({ error: 'Email já cadastrado.' });
 
-    // VERIFICAÇÃO DE ABUSO
     const { abuse, emailHash } = await checkTrialAbuse(email, fingerprint);
     
-    // LÓGICA ALTERADA: Se houve abuso, não bloqueia. Apenas expira o trial.
+    // Define se o usuário terá trial ou não
     const trialEnds = new Date();
     if (abuse) {
-        // Define data para ontem (Trial Expirado)
-        trialEnds.setDate(trialEnds.getDate() - 1);
+        trialEnds.setDate(trialEnds.getDate() - 1); // Expira trial
         console.log(`[Registro] Abuso detectado para ${email}. Criando conta sem trial.`);
     } else {
-        // Trial normal de 7 dias
-        trialEnds.setDate(trialEnds.getDate() + 7);
+        trialEnds.setDate(trialEnds.getDate() + 7); // Trial normal
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
     
     const result = await prisma.$transaction(async (prisma) => {
+        // 1. Cria o usuário
         const user = await prisma.user.create({
             data: {
                 email,
@@ -116,16 +114,15 @@ app.post('/tato/v2/auth/register', async (req, res) => {
             select: { id: true }
         });
 
-        // Só cria log se não existir (para evitar erro de unique no emailHash)
-        // Se for abuso por device mas email novo, cria o log do email novo.
-        try {
-            await prisma.trialLog.create({
-                data: {
-                    emailHash,
-                    fingerprint: fingerprint || null
-                }
-            });
-        } catch(e) { /* Ignora se já existe */ }
+        // 2. Garante o registro no Log de Trial (USANDO UPSERT PARA NÃO QUEBRAR A TRANSAÇÃO)
+        await prisma.trialLog.upsert({
+            where: { emailHash },
+            update: {}, // Se já existe, não faz nada (mantém o log original)
+            create: {
+                emailHash,
+                fingerprint: fingerprint || null
+            }
+        });
 
         return user;
     });
@@ -137,12 +134,12 @@ app.post('/tato/v2/auth/register', async (req, res) => {
     });
 
   } catch (error) {
-    console.error(error);
+    console.error("Erro Registro:", error);
     res.status(500).json({ error: 'Erro interno ao criar conta.' });
   }
 });
 
-// --- ROTA GOOGLE AUTH (CORRIGIDA) ---
+// --- ROTA GOOGLE AUTH ---
 app.post('/tato/v2/auth/google', async (req, res) => {
   const { googleToken, fingerprint } = req.body;
   
@@ -166,7 +163,6 @@ app.post('/tato/v2/auth/google', async (req, res) => {
         // NOVO USUÁRIO GOOGLE
         const { abuse, emailHash } = await checkTrialAbuse(email, fingerprint);
 
-        // LÓGICA ALTERADA: Expira o trial se houver abuso
         const trialEnds = new Date();
         if (abuse) {
             trialEnds.setDate(trialEnds.getDate() - 1);
@@ -190,11 +186,12 @@ app.post('/tato/v2/auth/google', async (req, res) => {
                 }
             });
 
-            try {
-                await prisma.trialLog.create({
-                    data: { emailHash, fingerprint: fingerprint || null }
-                });
-            } catch(e) { /* Ignora */ }
+            // USANDO UPSERT PARA NÃO QUEBRAR A TRANSAÇÃO
+            await prisma.trialLog.upsert({
+                where: { emailHash },
+                update: {}, 
+                create: { emailHash, fingerprint: fingerprint || null }
+            });
             
             return newUser;
         });
@@ -212,7 +209,15 @@ app.post('/tato/v2/auth/google', async (req, res) => {
         { expiresIn: '24h' }
     );
     
-    res.json({ token, name: user.name, plan: user.planType });
+    res.json({ 
+        token, 
+        name: user.name, 
+        plan: user.planType,
+        // Retorna aviso se acabou de criar e já estava expirado (abuso)
+        warning: (user.createdAt > new Date(Date.now() - 10000) && user.trialEndsAt < new Date()) 
+                 ? 'Período de teste já utilizado anteriormente.' 
+                 : null
+    });
 
   } catch (error) {
     console.error("Erro Google Auth:", error.message);
@@ -236,7 +241,7 @@ app.delete('/tato/v2/user/delete', async (req, res) => {
     }
 });
 
-// --- ROTA LOGIN (Simples) ---
+// --- ROTA LOGIN ---
 app.post('/tato/v2/auth/login', async (req, res) => {
   const { email, password } = req.body;
   try {
@@ -256,57 +261,8 @@ app.post('/tato/v2/auth/login', async (req, res) => {
   }
 });
 
-// --- ROTA VALIDATE USAGE ---
-app.post('/tato/v2/internal/validate-usage', async (req, res) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  if (!token) return res.status(401).json({ allowed: false, error: 'Token não fornecido' });
-
-  try {
-    const decoded = jwt.verify(token, SECRET_KEY);
-    const user = await prisma.user.findUnique({ 
-        where: { id: decoded.userId },
-        select: { id: true, planType: true, trialEndsAt: true, subscriptionStatus: true, messagesUsed: true }
-    });
-
-    if (!user) return res.status(404).json({ allowed: false, error: 'Usuário não encontrado' });
-
-    const now = new Date();
-
-    // Lógica de bloqueio: Se for trial e data expirada (trialEndsAt < now), bloqueia.
-    if (user.planType === 'TRIAL') {
-      if (now > user.trialEndsAt) {
-        return res.status(403).json({ 
-          allowed: false, 
-          error: 'Seu período de teste expirou. Por favor, assine um plano.' 
-        });
-      }
-    } else {
-      if (user.subscriptionStatus !== 'active') {
-        return res.status(403).json({ allowed: false, error: 'Assinatura inativa ou cancelada.' });
-      }
-    }
-
-    const limit = PLAN_CONFIG[user.planType]?.limit || 4000;
-    if (user.messagesUsed >= limit) {
-      return res.status(429).json({ allowed: false, error: `Limite atingido.` });
-    }
-
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { messagesUsed: { increment: 1 } }
-    });
-
-    return res.json({ allowed: true, plan: user.planType, usage: user.messagesUsed + 1 });
-
-  } catch (error) {
-    return res.status(403).json({ allowed: false, error: 'Token inválido' });
-  }
-});
-
 // --- ROTA DASHBOARD ---
 app.get('/tato/v2/user/dashboard', async (req, res) => {
-    // Mesma lógica anterior
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.status(401).json({ error: 'Token não fornecido' });
@@ -343,6 +299,53 @@ app.get('/tato/v2/user/dashboard', async (req, res) => {
     } catch (error) {
       return res.status(403).json({ error: 'Sessão inválida' });
     }
+});
+
+// --- ROTA VALIDATE USAGE ---
+app.post('/tato/v2/internal/validate-usage', async (req, res) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ allowed: false, error: 'Token não fornecido' });
+
+  try {
+    const decoded = jwt.verify(token, SECRET_KEY);
+    const user = await prisma.user.findUnique({ 
+        where: { id: decoded.userId },
+        select: { id: true, planType: true, trialEndsAt: true, subscriptionStatus: true, messagesUsed: true }
+    });
+
+    if (!user) return res.status(404).json({ allowed: false, error: 'Usuário não encontrado' });
+
+    const now = new Date();
+
+    if (user.planType === 'TRIAL') {
+      if (now > user.trialEndsAt) {
+        return res.status(403).json({ 
+          allowed: false, 
+          error: 'Seu período de teste expirou. Por favor, assine um plano.' 
+        });
+      }
+    } else {
+      if (user.subscriptionStatus !== 'active') {
+        return res.status(403).json({ allowed: false, error: 'Assinatura inativa ou cancelada.' });
+      }
+    }
+
+    const limit = PLAN_CONFIG[user.planType]?.limit || 4000;
+    if (user.messagesUsed >= limit) {
+      return res.status(429).json({ allowed: false, error: `Limite atingido.` });
+    }
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { messagesUsed: { increment: 1 } }
+    });
+
+    return res.json({ allowed: true, plan: user.planType, usage: user.messagesUsed + 1 });
+
+  } catch (error) {
+    return res.status(403).json({ allowed: false, error: 'Token inválido' });
+  }
 });
 
 if (process.env.NODE_ENV !== 'production') app.listen(port, () => console.log(`API running on ${port}`));
