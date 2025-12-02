@@ -13,19 +13,37 @@ if (process.env.NODE_ENV !== 'production') global.prisma = prisma;
 
 const port = process.env.PORT || 4000;
 const SECRET_KEY = process.env.JWT_SECRET;
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 
-const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
+// --- CONFIGURAÇÃO DE MÚLTIPLOS CLIENT IDS ---
+// Carrega os IDs de ambiente. É recomendável ter ambos no .env
+const GOOGLE_EXTENSION_CLIENT_ID = process.env.GOOGLE_CLIENT_ID; 
+const GOOGLE_WEB_CLIENT_ID = process.env.GOOGLE_WEB_CLIENT_ID;
 
-app.use(cors());
+// Lista de origens confiáveis (Audiences)
+const ALLOWED_GOOGLE_CLIENT_IDS = [
+    GOOGLE_EXTENSION_CLIENT_ID,
+    GOOGLE_WEB_CLIENT_ID
+].filter(id => !!id); // Remove undefined/null se alguma variavel não estiver setada
+
+// Instancia o cliente (pode usar qualquer um dos IDs para instanciar, ou nenhum)
+const googleClient = new OAuth2Client(GOOGLE_EXTENSION_CLIENT_ID);
+
+// Configuração CORS
+app.use(cors({
+    origin: '*', 
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
 
 const PLAN_LIMITS = {
   TRIAL: 4000,
   ESSENTIAL: 4000,
-  PROFESSIONAL: 6000
+  PROFESSIONAL: 8000
 };
 
+// ... (Rota validate-usage permanece igual) ...
 app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -87,6 +105,7 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
   }
 });
 
+// ... (Rota register permanece igual) ...
 app.post('/tato/v2/auth/register', async (req, res) => {
   const { email, password, name } = req.body;
 
@@ -127,6 +146,7 @@ app.post('/tato/v2/auth/register', async (req, res) => {
   }
 });
 
+// ... (Rota login permanece igual) ...
 app.post('/tato/v2/auth/login', async (req, res) => {
   const { email, password } = req.body;
 
@@ -153,21 +173,32 @@ app.post('/tato/v2/auth/login', async (req, res) => {
   }
 });
 
+// --- ROTA GOOGLE AUTH (Suporte Multi-Client) ---
 app.post('/tato/v2/auth/google', async (req, res) => {
   const { googleToken } = req.body;
   
+  if (!googleToken) {
+      return res.status(400).json({ error: 'Token do Google não fornecido.' });
+  }
+
   try {
-    // CORREÇÃO: Usamos getTokenInfo para validar tokens vindos do chrome.identity
-    const tokenInfo = await googleClient.getTokenInfo(googleToken);
+    // ALTERAÇÃO: Passamos o array de IDs permitidos no 'audience'.
+    // A biblioteca vai verificar se o token pertence a ALGUM desses IDs.
+    const ticket = await googleClient.verifyIdToken({
+        idToken: googleToken,
+        audience: ALLOWED_GOOGLE_CLIENT_IDS, 
+    });
+
+    const payload = ticket.getPayload();
     
-    // Segurança: Verifica se o token foi gerado para a SUA extensão
-    if (tokenInfo.aud !== GOOGLE_CLIENT_ID) {
-        return res.status(401).json({ error: 'Token gerado para aplicação desconhecida.' });
+    if (!payload) {
+        return res.status(401).json({ error: 'Token Google inválido.' });
     }
 
-    const { email, sub: googleId, email_verified } = tokenInfo;
+    // Opcional: Você pode checar qual ID foi usado: payload.aud
+    const { email, sub: googleId, email_verified, name, picture } = payload;
 
-    if (email_verified !== 'true' && email_verified !== true) {
+    if (!email_verified) {
         return res.status(401).json({ error: 'Email Google não verificado.' });
     }
 
@@ -177,20 +208,20 @@ app.post('/tato/v2/auth/google', async (req, res) => {
         const trialEnds = new Date();
         trialEnds.setDate(trialEnds.getDate() + 7);
         
-        // Define nome baseado no email se não vier no token
-        const fallbackName = email.split('@')[0];
+        const userName = name || email.split('@')[0];
 
         user = await prisma.user.create({
             data: { 
                 email, 
                 googleId, 
-                name: fallbackName, 
+                name: userName, 
                 planType: 'TRIAL',
                 trialEndsAt: trialEnds,
                 subscriptionStatus: 'active'
             }
         });
     } else if (!user.googleId) {
+        // Vincula a conta existente ao Google
         user = await prisma.user.update({
             where: { email },
             data: { googleId }
@@ -206,8 +237,8 @@ app.post('/tato/v2/auth/google', async (req, res) => {
     res.json({ token, name: user.name, plan: user.planType });
 
   } catch (error) {
-    console.error("Erro Google Auth:", error); // Útil manter log de erro de auth
-    res.status(401).json({ error: 'Token Google inválido.' });
+    console.error("Erro Google Auth:", error.message);
+    res.status(401).json({ error: 'Falha na autenticação com Google. Origem não autorizada.' });
   }
 });
 
@@ -218,6 +249,7 @@ app.get('/tato/v2/', (req, res) => {
 if (process.env.NODE_ENV !== 'production') {
     app.listen(port, () => {
         console.log(`Auth Server rodando localmente na porta ${port}`);
+        console.log(`Google Clients Permitidos:`, ALLOWED_GOOGLE_CLIENT_IDS);
     });
 }
 
