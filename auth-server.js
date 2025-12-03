@@ -48,35 +48,81 @@ app.post('/tato/v2/webhook', express.raw({ type: 'application/json' }), async (r
             case 'checkout.session.completed': {
                 const session = event.data.object;
                 
-                const userId = session.metadata?.userId || session.client_reference_id;
+                // Tenta pegar o ID de várias formas: Metadata, Client Reference ou busca por Email
+                let userId = session.metadata?.userId || session.client_reference_id;
                 const subscriptionId = session.subscription;
                 const customerId = session.customer;
-                
-                // CORREÇÃO 1: Prioriza o planType vindo dos metadados do checkout
-                // Se não houver metadados, faz o fallback para verificação de valor
-                let planType = session.metadata?.planType;
-                
-                if (!planType) {
-                    // Fallback antigo caso falte metadata
-                    planType = session.amount_total >= 3900 ? 'PROFESSIONAL' : 'ESSENTIAL';
+                const customerEmail = session.customer_details?.email || session.email;
+
+                // Se não veio ID direto, tenta achar o usuário pelo e-mail do checkout
+                if (!userId && customerEmail) {
+                    const userByEmail = await prisma.user.findUnique({ where: { email: customerEmail } });
+                    if (userByEmail) userId = userByEmail.id;
                 }
 
                 if (!userId) {
-                    console.error("Webhook: User ID não encontrado.");
+                    console.error("Webhook: User ID não encontrado (nem por ID, nem por email).");
                     break;
+                }
+
+                // --- CORREÇÃO ROBUSTA PARA DETECÇÃO DE PLANO (TRIAL & LINKS DIRETOS) ---
+                let planType = session.metadata?.planType;
+
+                // Se não veio no metadata (link direto), consultamos a assinatura expandindo o produto
+                if (!planType && subscriptionId) {
+                    try {
+                        // Expande 'product' para podermos checar o NOME do plano
+                        const subscription = await stripe.subscriptions.retrieve(subscriptionId, {
+                            expand: ['items.data.price.product']
+                        });
+                        
+                        const priceItem = subscription.items.data[0]?.price;
+                        const product = priceItem?.product; // Objeto produto expandido
+                        const priceAmount = priceItem?.unit_amount; // Preço recorrente real (ex: 3990)
+
+                        // 1. Prioridade: Verifica pelo NOME do produto (mais seguro para Trials)
+                        if (product && product.name) {
+                            const name = product.name.toLowerCase();
+                            if (name.includes('profissional') || name.includes('professional')) {
+                                planType = 'PROFESSIONAL';
+                            } else if (name.includes('essencial') || name.includes('essential')) {
+                                planType = 'ESSENTIAL';
+                            }
+                        }
+
+                        // 2. Fallback: Verifica pelo PREÇO recorrente (ignora se o pagto de hoje foi 0)
+                        if (!planType && priceAmount) {
+                            if (priceAmount >= 3900) {
+                                planType = 'PROFESSIONAL';
+                            } else {
+                                planType = 'ESSENTIAL';
+                            }
+                        }
+                        
+                        console.log(`[Webhook] Assinatura analisada. Produto: "${product?.name}", Preço: ${priceAmount}, Plano Definido: ${planType}`);
+
+                    } catch (subError) {
+                        console.error("[Webhook] Erro ao buscar detalhe da assinatura:", subError);
+                    }
+                }
+
+                // 3. Último recurso: Valor pago na sessão (falha em trials gratuitos, pois amount=0)
+                if (!planType) {
+                    planType = session.amount_total >= 3900 ? 'PROFESSIONAL' : 'ESSENTIAL';
+                    console.log(`[Webhook] Fallback para valor pago na sessão (pode ser impreciso em trials): ${planType}`);
                 }
 
                 await prisma.user.update({
                     where: { id: userId },
                     data: {
                         subscriptionStatus: 'active',
-                        planType: planType, // Usa o tipo correto recuperado
+                        planType: planType, 
                         stripeCustomerId: customerId,
                         stripeSubscriptionId: subscriptionId,
                         nextBillingDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
                     }
                 });
-                console.log(`[Stripe] Assinatura ativada para usuário ${userId}. Plano: ${planType}`);
+                console.log(`[Stripe] Assinatura ativada para usuário ${userId}. Plano Final: ${planType}`);
                 break;
             }
 
@@ -217,7 +263,7 @@ app.post('/tato/v2/payment/create-checkout', async (req, res) => {
             cancel_url: `${process.env.FRONTEND_URL}/checkout?canceled=true`,
             metadata: {
                 userId: user.id,
-                planType: planType // Importante: Enviamos o plano aqui para recuperar no webhook
+                planType: planType 
             }
         });
 
@@ -229,7 +275,7 @@ app.post('/tato/v2/payment/create-checkout', async (req, res) => {
     }
 });
 
-// CORREÇÃO 2: Novo endpoint para cancelamento direto de assinatura
+// Novo endpoint para cancelamento direto de assinatura
 app.post('/tato/v2/payment/cancel-subscription', async (req, res) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -244,10 +290,10 @@ app.post('/tato/v2/payment/cancel-subscription', async (req, res) => {
             return res.status(400).json({ error: 'Nenhuma assinatura ativa encontrada.' });
         }
 
-        // Cancela a assinatura no Stripe imediatamente (pode alterar para cancel_at_period_end: true se preferir)
+        // Cancela a assinatura no Stripe imediatamente
         await stripe.subscriptions.cancel(user.stripeSubscriptionId);
 
-        // Atualiza o banco de dados localmente (o webhook também faria isso, mas aqui garante resposta rápida na UI)
+        // Atualiza o banco de dados localmente
         await prisma.user.update({
             where: { id: user.id },
             data: { 
