@@ -51,26 +51,32 @@ app.post('/tato/v2/webhook', express.raw({ type: 'application/json' }), async (r
                 const userId = session.metadata?.userId || session.client_reference_id;
                 const subscriptionId = session.subscription;
                 const customerId = session.customer;
+                
+                // CORREÇÃO 1: Prioriza o planType vindo dos metadados do checkout
+                // Se não houver metadados, faz o fallback para verificação de valor
+                let planType = session.metadata?.planType;
+                
+                if (!planType) {
+                    // Fallback antigo caso falte metadata
+                    planType = session.amount_total >= 3900 ? 'PROFESSIONAL' : 'ESSENTIAL';
+                }
 
                 if (!userId) {
                     console.error("Webhook: User ID não encontrado.");
                     break;
                 }
 
-                let planType = 'ESSENTIAL';
-                if (session.amount_total >= 3900) planType = 'PROFESSIONAL';
-
                 await prisma.user.update({
                     where: { id: userId },
                     data: {
                         subscriptionStatus: 'active',
-                        planType: planType,
+                        planType: planType, // Usa o tipo correto recuperado
                         stripeCustomerId: customerId,
                         stripeSubscriptionId: subscriptionId,
                         nextBillingDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
                     }
                 });
-                console.log(`[Stripe] Assinatura ativada para usuário ${userId}`);
+                console.log(`[Stripe] Assinatura ativada para usuário ${userId}. Plano: ${planType}`);
                 break;
             }
 
@@ -127,19 +133,19 @@ app.use(express.json());
 const PLAN_CONFIG = {
   TRIAL: {
     name: 'Teste Gratuito',
-    limit: 4000,
+    limit: 2000,
     price: 'Grátis',
     priceRaw: 0
   },
   ESSENTIAL: {
     name: 'Essencial',
-    limit: 4000,
+    limit: 2000,
     price: 'R$ 19,90/mês',
     priceRaw: 19.90
   },
   PROFESSIONAL: {
     name: 'Profissional',
-    limit: 8000,
+    limit: 6000,
     price: 'R$ 39,90/mês',
     priceRaw: 39.90
   }
@@ -211,7 +217,7 @@ app.post('/tato/v2/payment/create-checkout', async (req, res) => {
             cancel_url: `${process.env.FRONTEND_URL}/checkout?canceled=true`,
             metadata: {
                 userId: user.id,
-                planType: planType 
+                planType: planType // Importante: Enviamos o plano aqui para recuperar no webhook
             }
         });
 
@@ -220,6 +226,41 @@ app.post('/tato/v2/payment/create-checkout', async (req, res) => {
     } catch (error) {
         console.error("Erro checkout:", error);
         res.status(500).json({ error: 'Erro ao criar checkout' });
+    }
+});
+
+// CORREÇÃO 2: Novo endpoint para cancelamento direto de assinatura
+app.post('/tato/v2/payment/cancel-subscription', async (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) return res.status(401).json({ error: 'Token não fornecido' });
+
+    try {
+        const decoded = jwt.verify(token, SECRET_KEY);
+        const user = await prisma.user.findUnique({ where: { id: decoded.userId }});
+
+        if (!user.stripeSubscriptionId) {
+            return res.status(400).json({ error: 'Nenhuma assinatura ativa encontrada.' });
+        }
+
+        // Cancela a assinatura no Stripe imediatamente (pode alterar para cancel_at_period_end: true se preferir)
+        await stripe.subscriptions.cancel(user.stripeSubscriptionId);
+
+        // Atualiza o banco de dados localmente (o webhook também faria isso, mas aqui garante resposta rápida na UI)
+        await prisma.user.update({
+            where: { id: user.id },
+            data: { 
+                subscriptionStatus: 'canceled',
+                planType: 'TRIAL' // Retorna para plano base/trial ou encerra
+            }
+        });
+
+        res.json({ success: true, message: 'Assinatura cancelada com sucesso.' });
+
+    } catch (error) {
+        console.error("Erro ao cancelar assinatura:", error);
+        res.status(500).json({ error: 'Erro ao cancelar assinatura.' });
     }
 });
 
