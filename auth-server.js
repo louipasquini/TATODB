@@ -650,18 +650,9 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
 
 // --- ROTA METRICS (ADMIN) ---
 app.get('/tato/v2/admin/metrics', async (req, res) => {
-    // TODO: Adicionar verificação de role 'ADMIN' se necessário no futuro.
-    // Por enquanto, qualquer usuário autenticado pode ver (ou restringir a um email específico).
-    // Vou manter aberto para autenticados para simplificar, conforme solicitado, 
-    // mas idealmente deveria ter check de admin.
-
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Token não fornecido' });
+    // Rota pública para dashboard de métricas (sem autenticação)
 
     try {
-        jwt.verify(token, SECRET_KEY);
-
         const now = new Date();
         const thirtyDaysAgo = new Date(now);
         thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
