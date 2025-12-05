@@ -158,6 +158,37 @@ app.post('/tato/v2/webhook', express.raw({ type: 'application/json' }), async (r
                 }
                 break;
             }
+
+            case 'invoice.payment_succeeded': {
+                const invoice = event.data.object;
+                const customerId = invoice.customer;
+                const subscriptionId = invoice.subscription;
+
+                // Verifica se é uma renovação de assinatura (billing_reason='subscription_cycle')
+                if (invoice.billing_reason === 'subscription_cycle') {
+                    const user = await prisma.user.findFirst({ where: { stripeCustomerId: customerId } });
+
+                    if (user) {
+                        // Calcula a nova data de cobrança (aproximada ou pega do invoice se disponível)
+                        // O invoice tem lines.data[0].period.end que é o fim do período faturado
+                        let nextBilling = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+                        if (invoice.lines?.data?.[0]?.period?.end) {
+                            nextBilling = new Date(invoice.lines.data[0].period.end * 1000);
+                        }
+
+                        await prisma.user.update({
+                            where: { id: user.id },
+                            data: {
+                                messagesUsed: 0, // Zera o contador mensal
+                                subscriptionStatus: 'active',
+                                nextBillingDate: nextBilling
+                            }
+                        });
+                        console.log(`[Stripe] Renovação processada para ${user.email}. Mensagens zeradas.`);
+                    }
+                }
+                break;
+            }
         }
     } catch (error) {
         console.error("Erro processando webhook:", error);
@@ -638,7 +669,10 @@ app.post('/tato/v2/internal/validate-usage', async (req, res) => {
 
         await prisma.user.update({
             where: { id: user.id },
-            data: { messagesUsed: { increment: 1 } }
+            data: {
+                messagesUsed: { increment: 1 },
+                totalMessagesUsed: { increment: 1 }
+            }
         });
 
         return res.json({ allowed: true, plan: user.planType, usage: user.messagesUsed + 1 });
@@ -670,10 +704,10 @@ app.get('/tato/v2/admin/metrics', async (req, res) => {
         // 2. Mensagens Refinadas (Total)
         const messagesRefinedAggregate = await prisma.user.aggregate({
             _sum: {
-                messagesUsed: true
+                totalMessagesUsed: true
             }
         });
-        const totalMessagesRefined = messagesRefinedAggregate._sum.messagesUsed || 0;
+        const totalMessagesRefined = messagesRefinedAggregate._sum.totalMessagesUsed || 0;
 
         // 3. Retenção D30
         // Definição: Usuários criados há mais de 30 dias que ainda estão ativos (updatedAt recente ou assinatura ativa)

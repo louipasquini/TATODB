@@ -36,6 +36,7 @@ model User {
   
   // Limites de Uso
   messagesUsed       Int       @default(0)
+  totalMessagesUsed  Int       @default(0)
   
   // Metadados
   createdAt          DateTime  @default(now())
