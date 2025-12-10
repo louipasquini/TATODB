@@ -16,7 +16,7 @@ if (process.env.NODE_ENV !== 'production') global.prisma = prisma;
 const port = process.env.PORT || 4000;
 const SECRET_KEY = process.env.JWT_SECRET;
 
-// Configuração Stripe
+// Configuração Stripe                                                                                                          
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const stripe = new Stripe(STRIPE_SECRET_KEY);
